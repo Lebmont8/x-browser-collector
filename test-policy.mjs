@@ -1,0 +1,46 @@
+import assert from 'node:assert/strict';import {LIMIT,normalize,gate,reserve,decision,failure,domFailure,updateCache,success,cachedProfile,dueAt,dispatchGuard,DOM_EXPRESSION} from './policy.mjs';
+let passed=0;function test(name,fn){fn();passed++;console.log('PASS '+name);}
+const t=Date.parse('2026-10-29T16:00:00Z'),author='example_author';
+const state=()=>normalize({day:'2026-10-29',used:4,lastRun:t,traffic:{day:'2026-10-29',total:90,unknownBeforeV2:true}});
+const body=(text='hello',id='100',count=1)=>({data:{user:{result:{timeline:{timeline:{instructions:[{entries:[{content:{itemContent:{tweet_results:{result:{rest_id:id,legacy:{full_text:text,favorite_count:count},core:{user_results:{result:{rest_id:'7',core:{screen_name:author}}}}}}}}}]}]}}}}}});
+test('migration preserves existing reservations',()=>assert.equal(normalize(state()).used,4));
+test('too-early normal and diagnostic starts share gate',()=>assert.equal(gate(state(),author,t+1),'min_run_interval'));
+test('daily cap rejects before browser work',()=>{let s=state();s.used=24;assert.equal(gate(s,author,t+3600000),'daily_cap');});
+test('per-run cap does not consume daily reservation',()=>{let s=state();assert.throws(()=>reserve(s,{reads:4,total:4},'data',t),/run_cap/);assert.equal(s.used,4);});
+test('data dispatch charges total and data',()=>{let s=state(),r={reads:0,total:0};reserve(s,r,'data',t);assert.equal(s.used,5);assert.equal(s.traffic.total,91);assert.equal(r.reads,1);});
+test('static dispatch does not charge data',()=>{let s=state(),r={reads:0,total:0};reserve(s,r,'static',t);assert.equal(s.used,4);assert.equal(s.traffic.total,91);});
+test('total traffic cap independently stops dispatch',()=>{let s=state();s.traffic.total=LIMIT.totalPerDay;assert.throws(()=>reserve(s,{reads:0,total:0},'data',t),/traffic_cap/);assert.equal(s.used,4);});
+test('day rollover retains prior budget audit',()=>{let s=state();reserve(s,{reads:0,total:0},'data',t+86400000);assert.equal(s.used,1);assert.equal(s.budgetHistory['2026-10-29'].used,4);});
+test('blocked state survives new day',()=>{let s=state();s.blocked='captcha';assert.equal(gate(s,author,t+86400000),'blocked_manual_check');});
+test('current originals timeline allowed',()=>assert.equal(decision({url:'https://x.com/i/api/graphql/x/UserOriginalsTimeline',method:'GET',type:'XHR'},author).kind,'data'));
+test('write API blocked',()=>assert.equal(decision({url:'https://x.com/i/api/graphql/x/CreateTweet',method:'POST',type:'XHR'},author).deny,'non_get'));
+test('DM read blocked',()=>assert.equal(decision({url:'https://x.com/i/api/graphql/x/DmInbox',method:'GET',type:'XHR'},author).deny,'api_not_allowed'));
+test('media blocked without dispatch',()=>assert.equal(decision({url:'https://pbs.twimg.com/a.jpg',method:'GET',type:'Image'},author).deny,'media'));
+test('auth redirect requests stop',()=>assert.equal(decision({url:'https://x.com/account/access',method:'GET',type:'Document'},author).stop,true));
+test('unexpected document redirect stops',()=>assert.equal(decision({url:'https://x.com/home',method:'GET',type:'Document'},author).stop,true));
+test('429 triggers stop',()=>assert.equal(failure(429),'rate_limited'));
+test('403 triggers stop',()=>assert.equal(failure(403),'auth_or_access_denied'));
+test('GraphQL auth error triggers stop',()=>assert.equal(failure(200,'',{errors:[{code:326}]}),'auth_or_challenge'));
+test('CAPTCHA DOM triggers stop',()=>assert.equal(domFailure({challenge:true}),'auth_or_challenge'));
+test('cache initial posts and original acquisition',()=>{let c={};let r=updateCache(c,body(),author,'2026-10-29T16:00:00Z');assert.deepEqual(r.newIds,['100']);assert.equal(c.posts['100'].firstAcquiredAt,'2026-10-29T16:00:00Z');});
+test('counter change is not an author edit',()=>{let c={};updateCache(c,body(),author,'2026-10-29T16:00:00Z');let r=updateCache(c,body('hello','100',99),author,'2026-10-29T17:00:00Z');assert.equal(r.changedIds.length,0);assert.equal(r.newIds.length,0);assert.equal(r.overlapReached,true);assert.equal(c.posts['100'].firstAcquiredAt,'2026-10-29T16:00:00Z');});
+test('changed text remains detectable',()=>{let c={};updateCache(c,body(),author,'2026-10-29T16:00:00Z');assert.deepEqual(updateCache(c,body('edited'),author,'2026-10-29T17:00:00Z').changedIds,['100']);});
+test('new ID advances high-water without deleting older',()=>{let c={};updateCache(c,body(),author,'2026-10-29T16:00:00Z');updateCache(c,body('new','101'),author,'2026-10-29T17:00:00Z');assert.equal(c.highWaterId,'101');assert.equal(Object.keys(c.posts).length,2);});
+test('empty successful cycles slow to 6h maximum',()=>{let s=state();for(let i=0;i<10;i++)success(s,author,{newIds:[],changedIds:[],overlapReached:true},t);assert.equal(s.streams[author].intervalMs,21600000);});
+test('new content resets interval to 1h',()=>{let s=state();success(s,author,{newIds:['101'],changedIds:[],overlapReached:true},t);assert.equal(s.streams[author].intervalMs,3600000);});
+test('profile cache expiry forces legitimate refresh',()=>{assert.equal(cachedProfile({profile:{acquiredAt:t}},t+100),true);assert.equal(cachedProfile({profile:{acquiredAt:t}},t+86400000),false);});
+test('all-known page is not absolute completeness',()=>{let c={};updateCache(c,body(),author,'2026-10-29T16:00:00Z');let r=updateCache(c,body(),author,'2026-10-29T17:00:00Z');assert.equal(r.overlapReached,true);assert.equal(r.complete,undefined);});
+console.log(JSON.stringify({ok:true,tests:passed,network:0}));
+
+test('queued dispatch stops on owner file',()=>assert.equal(dispatchGuard(state(),{}, {stopFile:true}),'owner_stop_file'));
+test('queued dispatch stops on aborted run',()=>assert.equal(dispatchGuard(state(),{}, {aborted:true}),'owner_stop_file'));
+test('queued dispatch stops at absolute expiry',()=>assert.equal(dispatchGuard(state(),{}, {now:t,until:t}),'bounded_session_complete'));
+test('queued dispatch respects persisted access block',()=>{let s=state();s.blocked='rate_limited';assert.equal(dispatchGuard(s,{}),'blocked_manual_check');});
+test('inflight run error blocks queue',()=>assert.equal(dispatchGuard(state(),{stopped:'traffic_cap'}),'traffic_cap'));
+test('unchallenged dispatch is allowed',()=>assert.equal(dispatchGuard(state(),{}),null));
+test('structured DOM excludes ordinary tweet body text',()=>{assert.ok(!DOM_EXPRESSION.includes('document.body'));assert.ok(DOM_EXPRESSION.includes('[role=dialog]'));});
+test('static 403 is still access denial',()=>assert.equal(failure(403,'https://abs.twimg.com/client.js'),'auth_or_access_denied'));
+console.log(JSON.stringify({ok:true,totalTests:passed,network:0}));
+
+test('startup passes 120 total requests without changing data limits',()=>{let s=state(),r={reads:0,total:119};reserve(s,r,'static',t);reserve(s,r,'static',t);assert.equal(r.total,121);assert.equal(s.used,4);assert.equal(LIMIT.perRun,4);assert.equal(LIMIT.perDay,24);assert.equal(LIMIT.totalPerDay,720);assert.equal(LIMIT.timeoutMs,45000);});
+console.log(JSON.stringify({ok:true,totalTests:passed,network:0}));
