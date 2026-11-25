@@ -1,6 +1,6 @@
 # X Browser Collector
 
-Bounded, read-only X timeline collection using an existing owner-authorized Chrome session over the Chrome DevTools Protocol. No API key or cookie export is included.
+Collect X timeline posts through your own signed-in Chrome session. The collector uses the Chrome DevTools Protocol and applies request and traffic limits. The repository contains no API keys or exported cookies.
 
 ## Included
 - Request allowlisting, traffic/data budgets, adaptive polling and a single-process lock.
